@@ -67,9 +67,9 @@ Speechtotext.sync()
   .then(() => console.log('Speechtotext model synced with database.'))
   .catch((error) => console.error('Error syncing speechtotext model:', error));
 
-// Konfigurasi Multer untuk upload file audio
+// Konfigurasi Multer untuk upload file ke memory
 const upload = multer({
-  dest: 'uploads/', 
+  storage: multer.memoryStorage(),  // Menggunakan memory storage
   fileFilter: (req, file, cb) => {
     const allowedMimes = [
       'audio/wav', 
@@ -77,9 +77,8 @@ const upload = multer({
       'audio/mp3', 
       'audio/x-wav', 
       'audio/x-pn-wav', 
-      'audio/wave' // Tambahkan MIME type 'audio/wave'
+      'audio/wave'
     ]; 
-    console.log('MIME type file:', file.mimetype); // Log MIME type untuk debugging
     if (allowedMimes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -91,25 +90,34 @@ const upload = multer({
   },
 });
 
+// Fungsi untuk mendapatkan sample rate dari file WAV
+async function getSampleRateFromWavBuffer(inputBuffer) {
+  const decoded = wav.decode(inputBuffer);
+  return decoded.sampleRate;  // Mengambil sample rate dari file WAV
+}
 
 // Fungsi konversi audio ke WAV
-async function convertAudioToWav(inputFile, tempWavFile) {
+async function convertAudioToWavBuffer(inputBuffer) {
   try {
-    execSync(`${ffmpeg} -i ${inputFile} -acodec pcm_s16le -ar 16000 ${tempWavFile}`, { stdio: 'ignore' });
-    return tempWavFile;
+    const tempWavFile = path.join(__dirname, 'temp.wav');
+    fs.writeFileSync(tempWavFile, inputBuffer);  // Menyimpan sementara di disk
+    const outputWavFile = path.join(__dirname, 'output.wav');
+    
+    // Konversi file audio ke WAV
+    execSync(`${ffmpeg} -i ${tempWavFile} -acodec pcm_s16le -ar 16000 ${outputWavFile}`);
+    return outputWavFile;
   } catch (error) {
     throw new Error('Error saat konversi audio ke WAV.');
   }
 }
 
-// Fungsi konversi ke mono
-async function convertToMono(inputFile, outputFile) {
-  const buffer = fs.readFileSync(inputFile);
-  const decoded = wav.decode(buffer);
+// Fungsi konversi ke mono (menggunakan buffer)
+async function convertToMonoBuffer(inputBuffer) {
+  const decoded = wav.decode(inputBuffer);
 
+  // Cek apakah sudah mono
   if (decoded.channelData.length === 1) {
-    fs.writeFileSync(outputFile, buffer);
-    return decoded.sampleRate;
+    return inputBuffer;
   }
 
   const monoChannel = decoded.channelData[0].map((_, i) =>
@@ -121,22 +129,24 @@ async function convertToMono(inputFile, outputFile) {
     channelData: [monoChannel],
   });
 
-  fs.writeFileSync(outputFile, Buffer.from(encoded));
-  return decoded.sampleRate;
+  return Buffer.from(encoded);  // Mengembalikan buffer mono
 }
 
-// Fungsi transkripsi audio
-async function transcribeAudio(audiofile, sampleRate) {
+// Fungsi transkripsi audio dari buffer
+async function transcribeAudioBuffer(audioBuffer) {
   const client = new speech.SpeechClient();
-  const file = fs.readFileSync(audiofile);
-  const audioBytes = file.toString('base64');
+
+  // Dapatkan sample rate dari audio buffer
+  const sampleRate = await getSampleRateFromWavBuffer(audioBuffer);
+
+  const audioBytes = audioBuffer.toString('base64');
 
   const request = {
     audio: { content: audioBytes },
     config: {
       encoding: 'LINEAR16',
-      sampleRateHertz: sampleRate,
-      languageCode: 'id-ID',
+      sampleRateHertz: sampleRate,  // Gunakan sample rate dari file audio
+      languageCode: 'id-ID',  // Bahasa yang digunakan (bahasa Indonesia)
     },
   };
 
@@ -159,35 +169,30 @@ async function saveTranscriptionToCloud(transcription, filename) {
 // Endpoint POST untuk Upload dan Transkripsi Audio
 app.post("/speechtotext", upload.single('audio'), async (req, res) => {
   try {
-    const { email, title } = req.body;  
+    const { email, title } = req.body;
 
     if (!email || !title || !req.file) {
       return res.status(400).json({ error: "Email, title, and audio file are required" });
     }
 
-    const file = req.file;  
-    const tempWavFile = path.join('uploads', `${path.parse(file.filename).name}_temp.wav`);
-    const monoFile = path.join('uploads', `${path.parse(file.filename).name}_mono.wav`);
+    const fileBuffer = req.file.buffer;  // Mengambil buffer file audio yang diupload
+    const monoBuffer = await convertToMonoBuffer(fileBuffer);  // Konversi audio ke mono
 
-    await convertAudioToWav(file.path, tempWavFile);
+    const transcription = await transcribeAudioBuffer(monoBuffer);  // Menggunakan fungsi transkripsi yang sudah dimodifikasi
 
-    const sampleRate = await convertToMono(tempWavFile, monoFile);
-
-    const transcription = await transcribeAudio(monoFile, sampleRate);
-
-    const transcriptionUrl = await saveTranscriptionToCloud(transcription, file.filename);
+    const transcriptionUrl = await saveTranscriptionToCloud(transcription, title);
 
     const transcriptionData = await Speechtotext.create({
-      audioUrl: transcriptionUrl, 
-      text: transcription,        
-      fileName: file.filename,    
-      createdByEmail: email,      
+      audioUrl: transcriptionUrl,
+      text: transcription,
+      fileName: title,
+      createdByEmail: email,
     });
 
     res.status(201).json({
       success: true,
       message: "Transcription created successfully",
-      data: transcriptionData,  
+      data: transcriptionData,
     });
   } catch (error) {
     console.error(error);
@@ -195,7 +200,7 @@ app.post("/speechtotext", upload.single('audio'), async (req, res) => {
       success: false,
       error: "Failed to create transcription",
     });
-  } 
+  }
 });
 
 // Endpoint GET untuk mendapatkan transkripsi berdasarkan email dalam URL path
